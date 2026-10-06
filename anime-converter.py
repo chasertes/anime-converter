@@ -18,12 +18,14 @@
 #   - определять аудио и субтитры;
 #   - отдавать приоритет русскому языку;
 #   - при необходимости находить внешние аудио/субтитры;
-#   - конвертировать видео в H.264 720p;
-#   - конвертировать звук в MP3;
+#   - конвертировать видео в H.264;
+#   - ограничивать максимальную высоту 720p без апскейла;
+#   - конвертировать звук в MP3 192k;
 #   - сохранять результат в MKV;
 #   - проверять готовый файл;
 #   - только после успешной проверки удалять исходник;
-#   - не запускать одновременно несколько экземпляров программы.
+#   - не запускать одновременно несколько экземпляров программы;
+#   - поддерживать безопасный режим --dry-run.
 #
 # ВАЖНО:
 #   Скрипт работает ТОЛЬКО с transmission/complete.
@@ -31,6 +33,7 @@
 # ============================================================
 
 
+import argparse
 import json
 import os
 import re
@@ -87,7 +90,6 @@ MIN_FILE_AGE = 30
 # ПОДДЕРЖИВАЕМЫЕ РАСШИРЕНИЯ
 # ============================================================
 
-# Видео, которые программа умеет находить.
 VIDEO_EXTENSIONS = {
     ".mkv",
     ".mp4",
@@ -100,7 +102,6 @@ VIDEO_EXTENSIONS = {
 }
 
 
-# Поддерживаемые внешние субтитры.
 SUBTITLE_EXTENSIONS = {
     ".ass",
     ".ssa",
@@ -111,7 +112,6 @@ SUBTITLE_EXTENSIONS = {
 }
 
 
-# Поддерживаемые внешние аудиофайлы.
 AUDIO_EXTENSIONS = {
     ".mka",
     ".aac",
@@ -126,16 +126,14 @@ AUDIO_EXTENSIONS = {
 
 
 # ============================================================
-# НАЗВАНИЯ КАТАЛОГОВ С ВНЕШНИМИ ДОРОЖКАМИ
+# НАЗВАНИЯ СПЕЦИАЛЬНЫХ КАТАЛОГОВ
 # ============================================================
 
-# Если внешний звук лежит, например, в:
+# Внешний audio разрешается искать в таких каталогах,
+# но только если они являются непосредственными дочерними
+# каталогами каталога, содержащего видео.
 #
-#   Anime/audio/
-#   Anime/озвучка/
-#
-# программа считает это дополнительным признаком того,
-# что файл действительно является аудиодорожкой для серии.
+# Поиск по родительским каталогам выше каталога видео запрещён.
 AUDIO_DIR_NAMES = {
     "audio",
     "audios",
@@ -150,7 +148,6 @@ AUDIO_DIR_NAMES = {
 }
 
 
-# Аналогично для субтитров.
 SUBTITLE_DIR_NAMES = {
     "sub",
     "subs",
@@ -164,16 +161,6 @@ SUBTITLE_DIR_NAMES = {
 # ЯЗЫКОВЫЕ МЕТКИ
 # ============================================================
 
-# Возможные обозначения языков в именах файлов и metadata.
-#
-# Например:
-#
-#   Episode.01.RUS.mkv
-#   Episode.01.JPN.mka
-#   Episode.01.ENG.ass
-#
-# будут распознаны соответственно как русский,
-# японский и английский.
 LANGUAGES = {
     "ru": (
         "ru",
@@ -202,9 +189,10 @@ LANGUAGES = {
 
 # Чем меньше число, тем выше приоритет.
 #
-# Русский будет выбран первым.
-# Если русского нет — японский.
-# Если японского нет — английский.
+# Основной порядок:
+#
+#     RU → JP → EN
+#
 LANGUAGE_PRIORITY = {
     "ru": 0,
     "jp": 1,
@@ -241,13 +229,13 @@ def run_command(
     """
     Запускает внешнюю программу.
 
-    Основные внешние программы, которые использует скрипт:
+    Основные внешние программы:
 
         ffprobe
         ffmpeg
 
-    stdout и stderr сохраняются в памяти, чтобы программа могла
-    обработать результат и записать ошибки в лог.
+    stdout и stderr сохраняются, чтобы программа могла
+    обработать результат и вывести ошибки в журнал.
     """
 
     return subprocess.run(
@@ -265,7 +253,7 @@ def run_command(
 
 def ffprobe_json(path: Path) -> dict:
     """
-    Получает техническую информацию о видео через ffprobe.
+    Получает техническую информацию о файле через ffprobe.
 
     В результате получаем JSON с информацией о:
 
@@ -275,24 +263,17 @@ def ffprobe_json(path: Path) -> dict:
         - codec;
         - language;
         - title;
-        - размерах видео и т.д.
+        - размерах видео.
     """
 
     result = run_command([
         "ffprobe",
-
-        # Не показывать лишний служебный вывод.
-        "-v", "error",
-
-        # Вернуть результат в JSON.
-        "-print_format", "json",
-
-        # Получить информацию о потоках.
+        "-v",
+        "error",
+        "-print_format",
+        "json",
         "-show_streams",
-
-        # Получить информацию о контейнере.
         "-show_format",
-
         str(path),
     ])
 
@@ -305,7 +286,7 @@ def ffprobe_json(path: Path) -> dict:
 
 def normalize_text(value: str) -> str:
     """
-    Приводит строку к более удобному для сравнения виду.
+    Приводит строку к удобному для сравнения виду.
 
     Например:
 
@@ -343,14 +324,10 @@ def detect_language(text: str) -> Optional[str]:
 
     text = normalize_text(text)
 
-    # Проверяем каждый известный язык.
     for language, tags in LANGUAGES.items():
 
-        # Проверяем все возможные обозначения этого языка.
         for tag in tags:
 
-            # Используем границы слова, чтобы, например,
-            # "eng" не совпал случайно с частью другого слова.
             if re.search(
                 rf"(?<![a-zа-я]){re.escape(tag)}(?![a-zа-я])",
                 text,
@@ -368,12 +345,12 @@ def stream_language(stream: dict) -> Optional[str]:
     """
     Определяет язык внутреннего аудио/субтитров.
 
-    В первую очередь смотрим metadata:
+    В первую очередь используются:
 
         tags.language
         tags.title
 
-    Если язык там не указан, дополнительно проверяем codec_name.
+    Если язык не найден, проверяется codec_name.
     """
 
     tags = stream.get("tags", {})
@@ -386,7 +363,9 @@ def stream_language(stream: dict) -> Optional[str]:
 
     for value in candidates:
 
-        language = detect_language(str(value))
+        language = detect_language(
+            str(value)
+        )
 
         if language:
             return language
@@ -407,7 +386,7 @@ def find_internal_tracks(
         - аудиодорожки;
         - субтитры.
 
-    Нас интересуют только:
+    Используются только:
 
         Russian
         Japanese
@@ -417,6 +396,7 @@ def find_internal_tracks(
     """
 
     try:
+
         data = ffprobe_json(path)
 
     except Exception as exc:
@@ -432,13 +412,12 @@ def find_internal_tracks(
     subtitles = []
 
 
-    # Перебираем все streams, которые нашёл ffprobe.
     for stream in data.get("streams", []):
 
-        language = stream_language(stream)
+        language = stream_language(
+            stream
+        )
 
-        # Если язык неизвестен или не входит в список
-        # нужных языков — эту дорожку не используем.
         if language not in LANGUAGE_PRIORITY:
             continue
 
@@ -446,31 +425,25 @@ def find_internal_tracks(
         item = {
             "index": stream.get("index"),
             "language": language,
-            "title": stream.get("tags", {}).get(
+            "title": stream.get(
+                "tags",
+                {},
+            ).get(
                 "title",
                 "",
             ),
         }
 
 
-        # Если это аудио — добавляем в список аудио.
         if stream.get("codec_type") == "audio":
 
             audio.append(item)
 
-
-        # Если это субтитры — добавляем в список субтитров.
         elif stream.get("codec_type") == "subtitle":
 
             subtitles.append(item)
 
 
-    # Сортировка:
-    #
-    #   RU
-    #   JP
-    #   EN
-    #
     audio.sort(
         key=lambda x: LANGUAGE_PRIORITY[x["language"]]
     )
@@ -488,46 +461,134 @@ def find_internal_tracks(
 
 def episode_numbers(name: str) -> List[str]:
     """
-    Пытается найти номера эпизодов в имени файла.
+    Извлекает номера эпизодов из имени.
 
-    Например:
+    Поддерживаются, например:
 
-        Anime - 01.mkv
-        Anime 01.mkv
-        Anime - 01-02.mkv
+        Anime - 01
+        Anime 01
+        Anime - 01-02
+        Anime E01
 
-    используются для дополнительного сравнения файлов.
-
-    Это особенно важно при поиске внешнего аудио/субтитров.
+    Возвращается список найденных номеров.
     """
 
-    patterns = [
-
-        # Диапазон вроде 01-02.
-        r"(?<!\d)(\d{1,4})\s*[-~]\s*\d{1,4}(?!\d)",
-
-        # Обычный номер эпизода.
-        r"(?<!\d)(\d{1,3})(?:v\d)?(?!\d)",
-    ]
-
+    normalized = normalize_text(name)
 
     result = []
 
 
-    for pattern in patterns:
+    # Явные конструкции Episode 01 / Ep 01 / E01.
+    explicit_patterns = [
+        r"\b(?:episode|ep|e)\s*0*(\d{1,4})\b",
+    ]
+
+
+    for pattern in explicit_patterns:
 
         for match in re.finditer(
             pattern,
-            name,
+            normalized,
         ):
-            result.append(match.group(1))
+
+            result.append(
+                match.group(1)
+            )
+
+
+    # Диапазоны 01-02.
+    for match in re.finditer(
+        r"(?<!\d)(\d{1,4})\s*[-~]\s*(\d{1,4})(?!\d)",
+        normalized,
+    ):
+
+        result.append(
+            match.group(1)
+        )
+
+        result.append(
+            match.group(2)
+        )
+
+
+    # Если явного Episode/E номера нет,
+    # разрешаем обычное число только как fallback.
+    #
+    # При этом числа вроде года 2024 тоже могут встретиться,
+    # поэтому они не являются самостоятельным основанием
+    # для выбора внешней дорожки.
+    if not result:
+
+        for match in re.finditer(
+            r"(?<!\d)(\d{1,3})(?!\d)",
+            normalized,
+        ):
+
+            value = match.group(1)
+
+            if int(value) <= 999:
+
+                result.append(value)
+
+
+    # Сохраняем порядок, но убираем дубликаты.
+    unique = []
+
+    for value in result:
+
+        if value not in unique:
+
+            unique.append(value)
+
+    return unique
+
+
+# ============================================================
+# НОМЕР СЕЗОНА
+# ============================================================
+
+def season_numbers(name: str) -> List[str]:
+    """
+    Извлекает явные номера сезонов.
+
+    Например:
+
+        S01
+        S02
+        Season 1
+
+    Если сезон явно указан в одном имени,
+    а в другом явно указан другой сезон,
+    такие файлы нельзя автоматически сопоставлять.
+    """
+
+    normalized = normalize_text(name)
+
+    result = []
+
+
+    pattern = (
+        r"\b(?:s|season)\s*0*(\d{1,3})\b"
+    )
+
+
+    for match in re.finditer(
+        pattern,
+        normalized,
+    ):
+
+        value = match.group(1)
+
+        if value not in result:
+
+            result.append(value)
 
 
     return result
 
 
 # ============================================================
-# НОРМАЛИЗОВАННОЕ ИМЯ ФАЙЛА
+# НОРМАЛИЗОВАННОЕ ИМЯ
 # ============================================================
 
 def normalized_stem(path: Path) -> str:
@@ -539,18 +600,15 @@ def normalized_stem(path: Path) -> str:
         - языковые обозначения;
         - содержимое [...] ;
         - содержимое (...) ;
-        - спецсимволы.
+        - лишние спецсимволы.
 
-    Это помогает сопоставлять:
-
-        Anime.01.mkv
-
-    с:
-
-        Anime.01.RUS.mka
+    Номер эпизода и сезон намеренно НЕ удаляются здесь:
+    они дополнительно проверяются отдельными функциями.
     """
 
-    text = normalize_text(path.stem)
+    text = normalize_text(
+        path.stem
+    )
 
 
     # Убираем известные языковые метки.
@@ -587,7 +645,74 @@ def normalized_stem(path: Path) -> str:
     )
 
 
-    return " ".join(text.split())
+    return " ".join(
+        text.split()
+    )
+
+
+# ============================================================
+# ИМЯ СЕРИИ
+# ============================================================
+
+def series_signature(path: Path) -> str:
+    """
+    Получает нормализованное имя anime/series.
+
+    Из имени удаляются:
+
+        - язык;
+        - Episode/Ep/E + номер;
+        - номер сезона;
+        - номер эпизода.
+
+    Это критически важно для внешних дорожек.
+
+    Например:
+
+        Anime A - Episode 01.mkv
+        Anime B - Episode 01.RUS.mka
+
+    после обработки будут иметь разные series_signature.
+
+    Поэтому совпадение только по "Episode 01" больше
+    не позволит автоматически подключить Anime B.
+    """
+
+    text = normalized_stem(path)
+
+
+    # Убираем конструкции Episode 01 / Ep 01 / E01.
+    text = re.sub(
+        r"\b(?:episode|ep|e)\s*\d{1,4}"
+        r"(?:\s*[-~]\s*\d{1,4})?\b",
+        " ",
+        text,
+    )
+
+
+    # Убираем Season 1 / S01.
+    text = re.sub(
+        r"\b(?:season|s)\s*\d{1,3}\b",
+        " ",
+        text,
+    )
+
+
+    # Удаляем отдельные номера эпизодов.
+    for episode in episode_numbers(
+        path.stem
+    ):
+
+        text = re.sub(
+            rf"(?<!\d){re.escape(episode)}(?!\d)",
+            " ",
+            text,
+        )
+
+
+    return " ".join(
+        text.split()
+    )
 
 
 # ============================================================
@@ -599,80 +724,193 @@ def similarity_score(
     candidate: Path,
 ) -> int:
     """
-    Оценивает вероятность того, что внешний файл относится
-    именно к данному видео.
+    Оценивает вероятность того, что candidate относится
+    именно к video.
 
-    Используются:
+    Важный принцип:
 
-        - сходство имён;
-        - совпадение слов;
-        - совпадение номера эпизода;
-        - дополнительные признаки каталога.
+        совпадение Episode 01 само по себе НЕ является
+        достаточным условием.
 
-    Чем выше score — тем вероятнее соответствие.
+    Обязательно учитывается anime/series name.
+
+    Алгоритм намеренно простой и предсказуемый.
     """
 
-    video_name = normalized_stem(video)
-    candidate_name = normalized_stem(candidate)
+    video_series = series_signature(
+        video
+    )
+
+    candidate_series = series_signature(
+        candidate
+    )
+
+
+    # Если невозможно определить series,
+    # автоматическое сопоставление небезопасно.
+    if not video_series or not candidate_series:
+
+        return -1000
+
 
     score = 0
 
 
-    # Полное совпадение нормализованных имён.
-    if video_name and candidate_name:
+    # ========================================================
+    # SERIES NAME
+    # ========================================================
 
-        if video_name == candidate_name:
+    if video_series == candidate_series:
 
-            score += 100
+        # Идеальное совпадение имени серии.
+        score += 100
 
 
-        # Одно имя содержится внутри другого.
-        elif (
-            video_name in candidate_name
-            or candidate_name in video_name
+    elif (
+        video_series in candidate_series
+        or candidate_series in video_series
+    ):
+
+        # Одно полное имя содержится в другом.
+        score += 75
+
+
+    else:
+
+        video_words = set(
+            video_series.split()
+        )
+
+        candidate_words = set(
+            candidate_series.split()
+        )
+
+
+        common_words = (
+            video_words
+            & candidate_words
+        )
+
+
+        # Нет общих слов в имени series —
+        # почти наверняка другой anime.
+        if not common_words:
+
+            return -1000
+
+
+        smaller_count = min(
+            len(video_words),
+            len(candidate_words),
+        )
+
+
+        if smaller_count == 0:
+
+            return -1000
+
+
+        similarity = (
+            len(common_words)
+            / smaller_count
+        )
+
+
+        # Требуем достаточно сильного совпадения.
+        if similarity < 0.60:
+
+            return -1000
+
+
+        score += (
+            50
+            + int(similarity * 20)
+        )
+
+
+    # ========================================================
+    # SEASON
+    # ========================================================
+
+    video_seasons = set(
+        season_numbers(
+            video.stem
+        )
+    )
+
+    candidate_seasons = set(
+        season_numbers(
+            candidate.stem
+        )
+    )
+
+
+    # Если сезон явно указан в обоих файлах,
+    # он обязан совпадать.
+    if (
+        video_seasons
+        and candidate_seasons
+    ):
+
+        if not (
+            video_seasons
+            & candidate_seasons
         ):
 
-            score += 60
+            return -1000
 
 
-        # Считаем совпадающие слова.
-        else:
-
-            video_words = set(
-                video_name.split()
-            )
-
-            candidate_words = set(
-                candidate_name.split()
-            )
-
-            score += (
-                len(video_words & candidate_words)
-                * 10
-            )
+        score += 20
 
 
-    # Дополнительно сравниваем номера эпизодов.
-    video_eps = set(
-        episode_numbers(video.stem)
+    # Если сезон есть только у одного файла,
+    # это не автоматический отказ, но и бонуса нет.
+
+
+    # ========================================================
+    # EPISODE
+    # ========================================================
+
+    video_episodes = set(
+        episode_numbers(
+            video.stem
+        )
     )
 
-    candidate_eps = set(
-        episode_numbers(candidate.stem)
+    candidate_episodes = set(
+        episode_numbers(
+            candidate.stem
+        )
     )
 
 
-    if video_eps and candidate_eps:
+    # Если номер эпизода определён у обоих файлов,
+    # он обязан совпадать.
+    if (
+        video_episodes
+        and candidate_episodes
+    ):
 
-        # Совпадает номер эпизода.
-        if video_eps & candidate_eps:
+        if not (
+            video_episodes
+            & candidate_episodes
+        ):
 
-            score += 50
+            return -1000
 
-        # Номера есть, но они разные.
-        else:
 
-            score -= 100
+        score += 30
+
+
+    # Если видео содержит номер эпизода,
+    # а кандидат вообще не содержит номера,
+    # безопаснее отказаться от автоматического выбора.
+    elif (
+        video_episodes
+        and not candidate_episodes
+    ):
+
+        return -1000
 
 
     return score
@@ -695,7 +933,84 @@ def candidate_language(
     -> ru
     """
 
-    return detect_language(path.name)
+    return detect_language(
+        path.name
+    )
+
+
+# ============================================================
+# ПОИСК КАТАЛОГОВ ДЛЯ ВНЕШНИХ ДОРОЖЕК
+# ============================================================
+
+def external_search_directories(
+    video: Path,
+    directory_names: set,
+) -> List[Path]:
+    """
+    Возвращает безопасные каталоги для поиска внешних дорожек.
+
+    Разрешены только:
+
+        1. каталог самого видео;
+        2. специальные каталоги, являющиеся непосредственными
+           дочерними каталогами каталога видео.
+
+    Например:
+
+        Anime/
+        ├── Episode 01.mkv
+        └── audio/
+            └── Episode 01.RUS.mka
+
+    разрешено.
+
+    А:
+
+        complete/
+        ├── Anime A/
+        │   └── Episode 01.mkv
+        └── audio/
+            └── Episode 01.RUS.mka
+
+    НЕ должно приводить к поиску в complete/audio.
+
+    Это защищает соседние anime/series от ошибочного matching.
+    """
+
+    directories = [
+        video.parent
+    ]
+
+
+    try:
+
+        for child in video.parent.iterdir():
+
+            if not child.is_dir():
+                continue
+
+
+            if (
+                child.name.lower()
+                not in directory_names
+            ):
+                continue
+
+
+            directories.append(
+                child
+            )
+
+
+    except OSError as exc:
+
+        log(
+            f"Unable to inspect external-track directories "
+            f"near {video}: {exc}"
+        )
+
+
+    return directories
 
 
 # ============================================================
@@ -708,88 +1023,145 @@ def find_external_tracks(
     directory_names: set,
 ) -> List[Tuple[int, Path, Optional[str]]]:
     """
-    Ищет внешние аудио или субтитры.
+    Ищет внешние audio/subtitle только в безопасном контексте.
 
-    Поиск происходит:
+    ВАЖНО:
 
-        - в каталоге самого видео;
-        - выше по дереву каталогов.
+        Родительские каталоги выше video.parent больше
+        никогда не сканируются.
 
-    Каждый найденный файл получает score.
+    Для каждого кандидата дополнительно проверяются:
+
+        - язык;
+        - series name;
+        - season;
+        - episode;
+        - отсутствие противоречий.
+
+    Если score недостаточно высокий,
+    файл вообще не возвращается как кандидат.
     """
 
     candidates = []
 
 
-    # Начинаем с каталога видео и постепенно идём выше.
-    for parent in [
-        video.parent
-    ] + list(video.parents):
+    search_dirs = external_search_directories(
+        video,
+        directory_names,
+    )
+
+
+    seen = set()
+
+
+    for search_dir in search_dirs:
 
         try:
-            entries = list(parent.iterdir())
+
+            entries = list(
+                search_dir.iterdir()
+            )
 
         except OSError:
 
             continue
 
 
-        # Перебираем файлы в текущем каталоге.
         for candidate in entries:
 
-            # Нам нужны только обычные файлы.
+            try:
+
+                candidate_key = candidate.resolve()
+
+            except OSError:
+
+                candidate_key = candidate
+
+
+            if candidate_key in seen:
+
+                continue
+
+
+            seen.add(
+                candidate_key
+            )
+
+
             if not candidate.is_file():
+
                 continue
 
 
-            # Проверяем расширение.
-            if candidate.suffix.lower() not in extension_set:
+            if (
+                candidate.suffix.lower()
+                not in extension_set
+            ):
+
                 continue
 
 
-            # Сам исходный видеофайл исключаем.
             if candidate == video:
+
                 continue
 
 
-            # Определяем язык внешнего файла.
-            language = candidate_language(candidate)
+            # =================================================
+            # ЯЗЫК
+            # =================================================
+
+            language = candidate_language(
+                candidate
+            )
 
 
-            # Если язык неизвестен или не нужен —
-            # внешний файл не используем.
+            # Если язык неизвестен,
+            # автоматически использовать файл нельзя.
             if language not in LANGUAGE_PRIORITY:
+
                 continue
 
 
-            # Вычисляем базовую схожесть имени.
+            # =================================================
+            # MATCHING
+            # =================================================
+
             score = similarity_score(
                 video,
                 candidate,
             )
 
 
-            # Если файл находится в специальном каталоге
-            # audio/subtitles/etc., добавляем дополнительные баллы.
-            if candidate.parent.name.lower() in directory_names:
+            # Консервативный порог.
+            #
+            # Лучше не подключить дорожку,
+            # чем подключить дорожку от другого anime.
+            if score < 80:
 
-                score += 30
+                continue
 
 
-            # Добавляем только потенциально подходящие кандидаты.
-            if score > 0:
+            # Специальный каталог даёт только небольшой
+            # дополнительный бонус.
+            #
+            # Он НЕ заменяет matching по series/episode.
+            if (
+                candidate.parent != video.parent
+            ):
 
-                candidates.append(
-                    (
-                        score,
-                        candidate,
-                        language,
-                    )
+                score += 10
+
+
+            candidates.append(
+                (
+                    score,
+                    candidate,
+                    language,
                 )
+            )
 
 
-    # Сначала самые похожие файлы,
-    # затем язык по приоритету.
+    # Лучшие кандидаты идут первыми.
     candidates.sort(
         key=lambda item: (
             -item[0],
@@ -815,12 +1187,14 @@ def select_external_track(
     directory_names: set,
 ) -> Optional[Path]:
     """
-    Выбирает лучший внешний audio/subtitle файл.
+    Выбирает внешний audio/subtitle.
 
-    Если соответствие слишком слабое, возвращается None.
+    Если два кандидата имеют одинаковый score,
+    но относятся к одному языку, автоматический выбор
+    считается неоднозначным и отменяется.
 
-    Это сделано специально, чтобы программа не добавляла
-    случайный аудиофайл или субтитры от другой серии.
+    Это дополнительная защита от случайного подключения
+    неправильного файла.
     """
 
     candidates = find_external_tracks(
@@ -831,17 +1205,62 @@ def select_external_track(
 
 
     if not candidates:
+
         return None
 
 
-    best_score, best_path, _ = candidates[0]
+    best_score = candidates[0][0]
 
 
-    # Минимальный порог доверия.
-    #
-    # Если score меньше 50, считаем совпадение ненадёжным.
-    if best_score < 50:
-        return None
+    # Берём только кандидатов с максимальным score.
+    best_candidates = [
+        item
+        for item in candidates
+        if item[0] == best_score
+    ]
+
+
+    # Если несколько файлов одного языка имеют одинаковый
+    # максимальный score, автоматический выбор опасен.
+    languages = {}
+
+    for item in best_candidates:
+
+        language = item[2]
+
+        languages.setdefault(
+            language,
+            [],
+        ).append(item)
+
+
+    for language, items in languages.items():
+
+        if len(items) > 1:
+
+            log(
+                "Ambiguous external track candidates for "
+                f"{video}, language={language}: "
+                + ", ".join(
+                    str(item[1])
+                    for item in items
+                )
+            )
+
+            # Не подключаем неоднозначный кандидат.
+            return None
+
+
+    best_score, best_path, best_language = (
+        candidates[0]
+    )
+
+
+    log(
+        f"Selected external track: "
+        f"{best_path} "
+        f"(language={best_language}, score={best_score})"
+    )
 
 
     return best_path
@@ -851,68 +1270,86 @@ def select_external_track(
 # ПРОВЕРКА СТАБИЛЬНОСТИ ФАЙЛА
 # ============================================================
 
-def is_stable(path: Path) -> bool:
+def is_stable(
+    path: Path,
+) -> bool:
     """
-    Проверяет, закончил ли Transmission записывать файл.
+    Проверяет, что файл перестал изменяться.
 
-    Алгоритм:
+    Последовательность:
 
-        1. Запоминаем размер.
-        2. Ждём STABILITY_DELAY секунд.
-        3. Снова смотрим размер.
-        4. Если размер изменился — файл ещё скачивается.
-        5. Проверяем возраст файла.
+        1. проверить возраст;
+        2. запомнить размер;
+        3. подождать;
+        4. снова проверить размер.
+
+    Если размер не изменился,
+    файл считается готовым к обработке.
     """
 
     try:
 
-        stat1 = path.stat()
-
-        time.sleep(
-            STABILITY_DELAY
-        )
-
-        stat2 = path.stat()
+        stat = path.stat()
 
     except OSError:
 
         return False
 
 
-    # Размер изменился — файл ещё записывается.
-    if stat1.st_size != stat2.st_size:
+    age = (
+        time.time()
+        - stat.st_mtime
+    )
+
+
+    if age < MIN_FILE_AGE:
 
         return False
 
 
-    # Проверяем, что файл достаточно старый.
-    age = time.time() - stat2.st_mtime
+    first_size = stat.st_size
 
-    return age >= MIN_FILE_AGE
+
+    time.sleep(
+        STABILITY_DELAY
+    )
+
+
+    try:
+
+        second_size = path.stat().st_size
+
+    except OSError:
+
+        return False
+
+
+    return first_size == second_size
 
 
 # ============================================================
-# ФОРМИРОВАНИЕ ПУТИ РЕЗУЛЬТАТА
+# OUTPUT PATH
 # ============================================================
 
 def output_path_for(
-    video: Path,
+    source: Path,
 ) -> Path:
     """
-    Строит путь выходного файла.
+    Строит путь готового файла.
 
-    Относительная структура внутри complete сохраняется.
+    Структура каталогов внутри COMPLETE
+    сохраняется внутри ONGOING.
 
     Например:
 
-        complete/Anime/S01/E01.mp4
+        complete/Anime/Episode 01.mkv
 
-    станет:
+    превращается в:
 
-        ongoing/Anime/S01/E01.mkv
+        ongoing/Anime/Episode 01.mkv
     """
 
-    relative = video.relative_to(
+    relative = source.relative_to(
         COMPLETE
     )
 
@@ -922,27 +1359,41 @@ def output_path_for(
 
 
 # ============================================================
-# ПРОВЕРКА ГОТОВОГО ФАЙЛА
+# ПРОВЕРКА ГОТОВОГО OUTPUT
 # ============================================================
 
 def validate_output(
     path: Path,
 ) -> bool:
     """
-    Проверяет, что результат действительно является
-    корректным видео.
+    Проверяет готовый output через ffprobe.
 
-    Проверяется:
+    Проверяем:
 
-        - ffprobe может открыть файл;
-        - существует видеопоток;
+        - файл существует;
+        - ffprobe может его прочитать;
+        - присутствует видеопоток;
         - codec = H.264;
-        - высота видео не больше 720.
+        - размеры определены;
+        - высота <= 720;
+        - ширина чётная;
+        - присутствует хотя бы один аудиопоток.
     """
+
+    if not path.exists():
+
+        log(
+            f"Output does not exist: {path}"
+        )
+
+        return False
+
 
     try:
 
-        data = ffprobe_json(path)
+        data = ffprobe_json(
+            path
+        )
 
     except Exception as exc:
 
@@ -955,20 +1406,26 @@ def validate_output(
 
     streams = data.get(
         "streams",
-        []
+        [],
     )
 
 
-    # Ищем видеопотоки.
+    # ========================================================
+    # VIDEO
+    # ========================================================
+
     video_streams = [
-        s
-        for s in streams
-        if s.get("codec_type") == "video"
+        stream
+        for stream in streams
+        if stream.get("codec_type") == "video"
     ]
 
 
-    # Если видео нет — результат некорректен.
     if not video_streams:
+
+        log(
+            f"Output has no video stream: {path}"
+        )
 
         return False
 
@@ -976,8 +1433,14 @@ def validate_output(
     video_stream = video_streams[0]
 
 
-    # Проверяем H.264.
-    if video_stream.get("codec_name") != "h264":
+    if (
+        video_stream.get("codec_name")
+        != "h264"
+    ):
+
+        log(
+            f"Output video codec is not H.264: {path}"
+        )
 
         return False
 
@@ -993,13 +1456,67 @@ def validate_output(
 
     if not width or not height:
 
+        log(
+            f"Output has invalid video dimensions: {path}"
+        )
+
         return False
 
 
-    # Высота должна быть максимум 720.
+    # Апскейла быть не должно:
+    # максимальная высота — 720.
     if height > 720:
 
+        log(
+            f"Output height is greater than 720: "
+            f"{width}x{height}"
+        )
+
         return False
+
+
+    # Ширина должна быть чётной,
+    # потому что scale использует -2.
+    if width % 2 != 0:
+
+        log(
+            f"Output width is not even: "
+            f"{width}x{height}"
+        )
+
+        return False
+
+
+    # ========================================================
+    # AUDIO
+    # ========================================================
+
+    audio_streams = [
+        stream
+        for stream in streams
+        if stream.get("codec_type") == "audio"
+    ]
+
+
+    if not audio_streams:
+
+        log(
+            f"Output has no audio stream: {path}"
+        )
+
+        return False
+
+
+    # Все выходные audio должны быть MP3.
+    for stream in audio_streams:
+
+        if stream.get("codec_name") != "mp3":
+
+            log(
+                f"Output contains non-MP3 audio: {path}"
+            )
+
+            return False
 
 
     return True
@@ -1016,13 +1533,14 @@ def build_ffmpeg_command(
     external_subtitle: Optional[Path],
 ) -> List[str]:
     """
-    Создаёт полный набор параметров для ffmpeg.
+    Создаёт полный набор параметров ffmpeg.
 
     Основные настройки:
 
         Video:
             libx264
-            720p
+            максимум 720p
+            без апскейла
             veryfast
 
         Audio:
@@ -1033,32 +1551,28 @@ def build_ffmpeg_command(
             copy
 
         Container:
-            определяется расширением .mkv
+            MKV
     """
 
-
-    # Базовая команда ffmpeg.
     command = [
         "ffmpeg",
 
-        # Не показывать баннер ffmpeg.
         "-hide_banner",
 
-        # Показывать только предупреждения и ошибки.
         "-loglevel",
         "warning",
 
-        # Перезаписывать временный файл.
         "-y",
 
-        # Основной источник.
         "-i",
         str(source),
     ]
 
 
-    # Если найден внешний звук,
-    # добавляем его как дополнительный input.
+    # --------------------------------------------------------
+    # ВНЕШНИЙ AUDIO
+    # --------------------------------------------------------
+
     if external_audio:
 
         command += [
@@ -1067,8 +1581,10 @@ def build_ffmpeg_command(
         ]
 
 
-    # Если найдены внешние субтитры,
-    # добавляем их как дополнительный input.
+    # --------------------------------------------------------
+    # ВНЕШНИЕ SUBTITLES
+    # --------------------------------------------------------
+
     if external_subtitle:
 
         command += [
@@ -1081,7 +1597,6 @@ def build_ffmpeg_command(
     # VIDEO
     # --------------------------------------------------------
 
-    # Берём первый видеопоток исходника.
     command += [
         "-map",
         "0:v:0",
@@ -1092,12 +1607,11 @@ def build_ffmpeg_command(
     # INTERNAL AUDIO / SUBTITLES
     # --------------------------------------------------------
 
-    audio_tracks, subtitle_tracks = find_internal_tracks(
-        source
+    audio_tracks, subtitle_tracks = (
+        find_internal_tracks(source)
     )
 
 
-    # Добавляем подходящие внутренние аудиодорожки.
     for track in audio_tracks:
 
         command += [
@@ -1106,7 +1620,8 @@ def build_ffmpeg_command(
         ]
 
 
-    # Добавляем внешний звук, если он найден.
+    # Внешний audio input идёт после source,
+    # поэтому его индекс всегда 1.
     if external_audio:
 
         command += [
@@ -1115,7 +1630,6 @@ def build_ffmpeg_command(
         ]
 
 
-    # Добавляем внутренние субтитры.
     for track in subtitle_tracks:
 
         command += [
@@ -1124,15 +1638,21 @@ def build_ffmpeg_command(
         ]
 
 
-    # Если внешний звук присутствует,
-    # индекс внешних субтитров будет 2.
+    # Если external_audio есть:
     #
-    # Если внешнего звука нет,
-    # внешний subtitle input будет 1.
+    #   source = 0
+    #   audio  = 1
+    #   subtitle = 2
+    #
+    # Если external_audio отсутствует:
+    #
+    #   source = 0
+    #   subtitle = 1
+    #
     if external_subtitle:
 
         subtitle_input_index = (
-            1 + bool(external_audio)
+            1 + int(bool(external_audio))
         )
 
         command += [
@@ -1141,95 +1661,84 @@ def build_ffmpeg_command(
         ]
 
 
-    # --------------------------------------------------------
-    # КОДИРОВАНИЕ
-    # --------------------------------------------------------
+    # ========================================================
+    # VIDEO SCALE
+    # ========================================================
+    #
+    # Ключевая защита от апскейла:
+    #
+    #     input <= 720p -> исходная высота
+    #     input > 720p  -> высота 720
+    #
+    # -2 автоматически рассчитывает чётную ширину
+    # с сохранением исходных пропорций.
+    # ========================================================
 
     command += [
-
-        # Масштабирование до 720p.
-        #
-        # -2 означает:
-        #   ширина вычисляется автоматически,
-        #   сохраняя пропорции и делая её чётной.
         "-vf",
-        "scale=-2:720",
+        "scale='if(gt(ih,720),-2,iw)':'if(gt(ih,720),720,ih)'",
 
-        # H.264.
         "-c:v",
         "libx264",
 
-        # Быстрый preset.
         "-preset",
         "veryfast",
 
-        # MP3 для всех аудиодорожек.
         "-c:a",
         "libmp3lame",
 
-        # Битрейт аудио.
         "-b:a",
         "192k",
 
-        # Субтитры не перекодируем.
         "-c:s",
         "copy",
 
-        # Сохраняем metadata исходника.
         "-map_metadata",
         "0",
 
-        # Сохраняем главы.
         "-map_chapters",
         "0",
     ]
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # DEFAULT AUDIO
-    # --------------------------------------------------------
+    # ========================================================
 
-    # Количество аудиодорожек:
-    #
-    #   внутренние + внешний файл, если есть.
     audio_count = (
         len(audio_tracks)
-        + (1 if external_audio else 0)
+        + int(bool(external_audio))
     )
 
 
     if audio_count:
 
-        # Первой дорожке даём default.
-        #
-        # Поскольку дорожки предварительно отсортированы
-        # по языку, при наличии русского он будет первым.
+        # Аудиодорожки предварительно отсортированы
+        # по приоритету RU -> JP -> EN.
         command += [
             "-disposition:a:0",
             "default",
         ]
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # DEFAULT SUBTITLE
-    # --------------------------------------------------------
+    # ========================================================
 
     subtitle_count = (
         len(subtitle_tracks)
-        + (1 if external_subtitle else 0)
+        + int(bool(external_subtitle))
     )
 
 
     if subtitle_count:
 
-        # Первые субтитры помечаем default.
         command += [
             "-disposition:s:0",
             "default",
         ]
 
 
-    # Последний аргумент — имя выходного файла.
     command += [
         str(output)
     ]
@@ -1239,45 +1748,48 @@ def build_ffmpeg_command(
 
 
 # ============================================================
-# ОБРАБОТКА ОДНОГО ВИДЕО
+# БЕЗОПАСНАЯ ОБРАБОТКА ОДНОГО ВИДЕО
 # ============================================================
 
 def process_video(
     video: Path,
+    dry_run: bool = False,
 ) -> None:
     """
-    Полный цикл обработки одного видео.
+    Обрабатывает одно видео.
 
-    Последовательность:
+    В обычном режиме:
 
-        1. Определить выходной путь.
-        2. Проверить, не существует ли результат.
-        3. Проверить стабильность исходника.
-        4. Найти внутренние дорожки.
-        5. При необходимости найти внешние дорожки.
-        6. Создать временный output.
-        7. Запустить ffmpeg.
-        8. Проверить результат.
-        9. Переместить его в финальное имя.
-        10. Только после этого удалить исходник.
+        1. определяет output;
+        2. проверяет стабильность;
+        3. находит дорожки;
+        4. создаёт .processing;
+        5. запускает ffmpeg;
+        6. проверяет .processing;
+        7. переименовывает в final;
+        8. снова проверяет final;
+        9. удаляет исходник.
+
+    В dry-run:
+
+        - ffmpeg НЕ запускается;
+        - файлы НЕ создаются;
+        - исходник НЕ удаляется;
+        - файлы НЕ перемещаются;
+        - только показывается предполагаемая команда.
     """
 
+    # ========================================================
+    # OUTPUT
+    # ========================================================
 
-    # Вычисляем путь готового файла.
     output = output_path_for(
         video
     )
 
 
-    # Создаём каталог результата, если его ещё нет.
-    output.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-    # Если готовый файл уже существует,
-    # повторно его не обрабатываем.
+    # Если output уже существует,
+    # повторно обрабатывать исходник не нужно.
     if output.exists():
 
         log(
@@ -1287,8 +1799,10 @@ def process_video(
         return
 
 
-    # Проверяем, что Transmission действительно
-    # закончил работу с файлом.
+    # Проверяем стабильность исходного файла.
+    #
+    # Даже dry-run не должен считать совсем свежий файл
+    # полностью готовым.
     if not is_stable(video):
 
         log(
@@ -1298,19 +1812,21 @@ def process_video(
         return
 
 
-    # Ищем внутренние аудио и субтитры.
-    audio_tracks, subtitle_tracks = find_internal_tracks(
-        video
+    # ========================================================
+    # INTERNAL TRACKS
+    # ========================================================
+
+    audio_tracks, subtitle_tracks = (
+        find_internal_tracks(video)
     )
 
 
-    # По умолчанию внешних дорожек нет.
     external_audio = None
     external_subtitle = None
 
 
-    # Если подходящих внутренних аудиодорожек нет,
-    # пытаемся найти внешний аудиофайл.
+    # Если подходящих внутренних аудио нет,
+    # ищем безопасный внешний источник.
     if not audio_tracks:
 
         external_audio = select_external_track(
@@ -1320,8 +1836,8 @@ def process_video(
         )
 
 
-    # Если подходящих внутренних субтитров нет,
-    # пытаемся найти внешний subtitle-файл.
+    # Если внутренних субтитров нет,
+    # ищем безопасный внешний источник.
     if not subtitle_tracks:
 
         external_subtitle = select_external_track(
@@ -1331,7 +1847,10 @@ def process_video(
         )
 
 
-    # Пишем в журнал информацию о предстоящей обработке.
+    # ========================================================
+    # ИНФОРМАЦИЯ О ФАЙЛЕ
+    # ========================================================
+
     log(
         f"Processing: {video}"
     )
@@ -1341,39 +1860,29 @@ def process_video(
     )
 
 
-    # --------------------------------------------------------
-    # ЛОГИРОВАНИЕ ВНУТРЕННИХ AUDIO
-    # --------------------------------------------------------
-
     if audio_tracks:
 
         log(
             "Internal audio: "
             + ", ".join(
-                f"{track['language']}:{track['title'] or 'untitled'}"
+                f"{track['language']}:"
+                f"{track['title'] or 'untitled'}"
                 for track in audio_tracks
             )
         )
 
-
-    # --------------------------------------------------------
-    # ЛОГИРОВАНИЕ ВНУТРЕННИХ SUBTITLE
-    # --------------------------------------------------------
 
     if subtitle_tracks:
 
         log(
             "Internal subtitles: "
             + ", ".join(
-                f"{track['language']}:{track['title'] or 'untitled'}"
+                f"{track['language']}:"
+                f"{track['title'] or 'untitled'}"
                 for track in subtitle_tracks
             )
         )
 
-
-    # --------------------------------------------------------
-    # ЛОГИРОВАНИЕ ВНЕШНЕГО AUDIO
-    # --------------------------------------------------------
 
     if external_audio:
 
@@ -1381,10 +1890,6 @@ def process_video(
             f"External audio: {external_audio}"
         )
 
-
-    # --------------------------------------------------------
-    # ЛОГИРОВАНИЕ ВНЕШНИХ SUBTITLE
-    # --------------------------------------------------------
 
     if external_subtitle:
 
@@ -1394,14 +1899,65 @@ def process_video(
 
 
     # ========================================================
-    # ВРЕМЕННЫЙ ФАЙЛ
+    # DRY-RUN
     # ========================================================
     #
-    # Например:
+    # В этом режиме мы намеренно не создаём каталог output,
+    # временный файл или какой-либо другой объект.
     #
-    #   Episode 01.mkv.processing
+    # Команда ffmpeg только строится и выводится.
+    # ========================================================
+
+    if dry_run:
+
+        # Для dry-run можно использовать предполагаемый
+        # .processing path — он нигде не создаётся.
+        tmp_output = output.with_name(
+            output.name + ".processing"
+        )
+
+
+        command = build_ffmpeg_command(
+            video,
+            tmp_output,
+            external_audio,
+            external_subtitle,
+        )
+
+
+        log(
+            "DRY-RUN: ffmpeg command:"
+        )
+
+        log(
+            "DRY-RUN: "
+            + " ".join(
+                command
+            )
+        )
+
+
+        return
+
+
+    # ========================================================
+    # СОЗДАНИЕ OUTPUT КАТАЛОГА
+    # ========================================================
+
+    output.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+    # ========================================================
+    # ВРЕМЕННЫЙ OUTPUT
+    # ========================================================
     #
-    # До успешного завершения такой файл не считается готовым.
+    # .processing никогда не считается готовым результатом.
+    #
+    # Если ffmpeg аварийно завершится,
+    # исходный файл остаётся нетронутым.
     # ========================================================
 
     tmp_output = output.with_name(
@@ -1409,20 +1965,30 @@ def process_video(
     )
 
 
-    # Если после предыдущего аварийного запуска остался
-    # старый временный файл — удаляем его.
+    # Если старый .processing существует,
+    # он удаляется только как временный незавершённый output.
+    #
+    # Исходный video при этом не затрагивается.
     if tmp_output.exists():
 
         try:
 
             tmp_output.unlink()
 
-        except OSError:
+        except OSError as exc:
 
-            pass
+            log(
+                f"Cannot remove stale processing file "
+                f"{tmp_output}: {exc}"
+            )
+
+            return
 
 
-    # Создаём команду ffmpeg.
+    # ========================================================
+    # FFMPEG COMMAND
+    # ========================================================
+
     command = build_ffmpeg_command(
         video,
         tmp_output,
@@ -1433,17 +1999,20 @@ def process_video(
 
     try:
 
-        # Запускаем ffmpeg.
-        #
-        # check=False нужен для того, чтобы самим обработать
-        # ошибку и удалить временный файл.
+        # ====================================================
+        # FFMPEG
+        # ====================================================
+
         result = run_command(
             command,
             check=False,
         )
 
 
-        # ffmpeg завершился с ошибкой.
+        # Любая ошибка ffmpeg означает:
+        #
+        #   output недействителен;
+        #   исходник НЕ удаляем.
         if result.returncode != 0:
 
             log(
@@ -1465,7 +2034,13 @@ def process_video(
 
 
         # ====================================================
-        # ПРОВЕРКА ВРЕМЕННОГО ФАЙЛА
+        # ПРОВЕРКА TEMPORARY OUTPUT
+        # ====================================================
+        #
+        # Если ffmpeg сообщил успех, всё равно нельзя
+        # доверять exit code как единственной проверке.
+        #
+        # Проверяем реальный контейнер и streams.
         # ====================================================
 
         if not validate_output(
@@ -1486,15 +2061,18 @@ def process_video(
                 pass
 
 
+            # КРИТИЧЕСКОЕ ПРАВИЛО:
+            #
+            # Исходник здесь НЕ удаляется.
             return
 
 
         # ====================================================
-        # ПЕРЕМЕЩЕНИЕ В ФИНАЛЬНЫЙ ФАЙЛ
+        # ATOMIC RENAME
         # ====================================================
         #
-        # Только теперь .processing превращается
-        # в настоящий готовый output.
+        # Только после успешной проверки temporary output
+        # он становится финальным файлом.
         # ====================================================
 
         os.replace(
@@ -1503,7 +2081,14 @@ def process_video(
         )
 
 
-        # Повторно проверяем уже финальный файл.
+        # ====================================================
+        # ПОВТОРНАЯ ПРОВЕРКА FINAL OUTPUT
+        # ====================================================
+        #
+        # Проверяем уже тот файл, который будет оставлен
+        # пользователю.
+        # ====================================================
+
         if not validate_output(
             output
         ):
@@ -1512,6 +2097,11 @@ def process_video(
                 f"Final validation failed: {output}"
             )
 
+
+            # Исходник НЕ удаляется.
+            #
+            # Более того, output остаётся для диагностики,
+            # а оригинал продолжает существовать.
             return
 
 
@@ -1519,15 +2109,21 @@ def process_video(
         # УДАЛЕНИЕ ИСХОДНИКА
         # ====================================================
         #
-        # Это критически важный момент.
+        # Это единственное место, где исходник удаляется.
         #
-        # Исходный файл удаляется только после:
+        # К этому моменту гарантируется:
         #
-        #   - успешного ffmpeg;
-        #   - проверки временного output;
-        #   - перемещения output;
-        #   - повторной проверки финального файла.
-        # ====================================================
+        #   1. ffmpeg завершился успешно;
+        #   2. temporary output проверен;
+        #   3. output перемещён в final;
+        #   4. final output повторно проверен;
+        #   5. output содержит H.264;
+        #   6. высота <= 720;
+        #   7. ширина чётная;
+        #   8. присутствует MP3 audio.
+        #
+        # При любой ошибке выше этот код не выполняется.
+        # ========================================================
 
         video.unlink()
 
@@ -1543,14 +2139,14 @@ def process_video(
 
     except Exception as exc:
 
-        # Любая неожиданная ошибка не должна
-        # приводить к удалению исходника.
+        # Любая неожиданная ошибка не должна приводить
+        # к удалению исходного файла.
         log(
             f"Processing exception for {video}: {exc}"
         )
 
 
-        # Пытаемся удалить недоделанный output.
+        # Удаляем только временный незавершённый output.
         try:
 
             tmp_output.unlink()
@@ -1564,23 +2160,20 @@ def process_video(
 # СКАНИРОВАНИЕ COMPLETE
 # ============================================================
 
-def scan() -> None:
+def scan(
+    dry_run: bool = False,
+) -> None:
     """
-    Один проход по каталогу complete.
+    Выполняет один проход по каталогу complete.
 
-    ВАЖНО:
+    В dry-run:
 
-        rglob("*") работает только внутри COMPLETE.
-
-    Поэтому каталог:
-
-        transmission/incomplete
-
-    вообще не затрагивается.
+        - один scan;
+        - команды только показываются;
+        - ffmpeg не запускается;
+        - файлы не изменяются.
     """
 
-    # Если complete отсутствует,
-    # просто записываем это в лог.
     if not COMPLETE.exists():
 
         log(
@@ -1590,32 +2183,37 @@ def scan() -> None:
         return
 
 
-    # Рекурсивно перебираем всё дерево complete.
+    # rglob работает только внутри COMPLETE.
+    #
+    # transmission/incomplete здесь физически недоступен
+    # для сканирования.
     for path in COMPLETE.rglob("*"):
 
-        # Интересуют только файлы.
         if not path.is_file():
 
             continue
 
 
-        # Проверяем расширение.
-        if path.suffix.lower() not in VIDEO_EXTENSIONS:
+        if (
+            path.suffix.lower()
+            not in VIDEO_EXTENSIONS
+        ):
 
             continue
 
 
-        # Каждый подходящий файл обрабатывается отдельно.
         try:
 
             process_video(
-                path
+                path,
+                dry_run=dry_run,
             )
+
 
         except Exception as exc:
 
-            # Ошибка одного файла не должна остановить
-            # обработку всей коллекции.
+            # Ошибка одного файла не должна останавливать
+            # обработку остальных.
             log(
                 f"Unhandled error for {path}: {exc}"
             )
@@ -1629,19 +2227,21 @@ def acquire_lock():
     """
     Создаёт эксклюзивную flock-блокировку.
 
-    Если второй экземпляр программы уже запущен,
-    он сразу завершится.
+    ВАЖНО:
 
-    Это защищает от ситуации:
+        fcntl.flock() привязан к открытому file descriptor.
 
-        worker #1 -> обрабатывает Episode 01
-        worker #2 -> одновременно обрабатывает Episode 01
+    Поэтому вызывающий код ОБЯЗАН сохранить возвращённый
+    file handle живым до завершения процесса.
+
+    Если второй экземпляр уже работает,
+    новый экземпляр сразу завершается.
     """
 
     import fcntl
 
 
-    # Убеждаемся, что родительский каталог существует.
+    # Каталог для lock-файла должен существовать.
     LOCK_FILE.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -1649,6 +2249,9 @@ def acquire_lock():
 
 
     # Открываем lock-файл.
+    #
+    # Само существование файла НЕ является механизмом блокировки.
+    # Важен именно fcntl.flock().
     lock_handle = open(
         LOCK_FILE,
         "w",
@@ -1657,7 +2260,7 @@ def acquire_lock():
 
     try:
 
-        # Пытаемся получить неблокирующую эксклюзивную блокировку.
+        # Неблокирующая эксклюзивная блокировка.
         fcntl.flock(
             lock_handle,
             fcntl.LOCK_EX | fcntl.LOCK_NB,
@@ -1666,18 +2269,74 @@ def acquire_lock():
 
     except BlockingIOError:
 
-        # Другой экземпляр уже работает.
+        # Другой экземпляр уже удерживает flock.
         log(
             "Another anime-converter instance is already running."
         )
 
+
+        # Закрываем descriptor перед выходом.
+        lock_handle.close()
+
+
         sys.exit(1)
 
 
-    # Важно вернуть открытый handle.
+    except Exception:
+
+        # При другой ошибке также освобождаем descriptor.
+        lock_handle.close()
+
+        raise
+
+
+    # ========================================================
+    # КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ
+    # ========================================================
+    #
+    # Возвращаем handle вызывающему коду.
+    #
+    # main() обязан сохранить эту ссылку.
     #
     # Пока handle жив, flock продолжает действовать.
+    # ========================================================
+
     return lock_handle
+
+
+# ============================================================
+# ARGUMENTS
+# ============================================================
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    Разбирает аргументы командной строки.
+
+    Поддерживается:
+
+        --dry-run
+
+    Dry-run специально сделан одноразовым:
+    это позволяет безопасно проверить текущее содержимое
+    complete без запуска daemon loop.
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Anime converter"
+    )
+
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "scan once and show planned ffmpeg commands "
+            "without modifying files"
+        ),
+    )
+
+
+    return parser.parse_args()
 
 
 # ============================================================
@@ -1688,33 +2347,91 @@ def main() -> None:
     """
     Главная функция программы.
 
-    Здесь:
+    Обычный режим:
 
-        - устанавливается lock;
-        - создаётся каталог output;
-        - запускается бесконечный цикл;
-        - каждые SCAN_INTERVAL секунд выполняется сканирование.
+        - получает flock;
+        - сохраняет file handle;
+        - создаёт output;
+        - запускает daemon loop.
+
+    Dry-run:
+
+        - lock не требуется;
+        - выполняется один scan;
+        - программа завершается.
     """
 
+    args = parse_arguments()
 
-    # Не позволяем запускать два worker одновременно.
-    acquire_lock()
+
+    # ========================================================
+    # LOCK
+    # ========================================================
+    #
+    # В dry-run lock не нужен, потому что этот режим:
+    #
+    #   - не запускает ffmpeg;
+    #   - не создаёт output;
+    #   - не удаляет исходники;
+    #   - не перемещает файлы.
+    #
+    # В обычном режиме handle сохраняется в локальной переменной
+    # main() на весь срок жизни процесса.
+    # ========================================================
+
+    lock_handle = None
+
+
+    if not args.dry_run:
+
+        lock_handle = acquire_lock()
 
 
     log(
         "anime-converter started"
     )
 
+
+    if args.dry_run:
+
+        log(
+            "DRY-RUN mode enabled: "
+            "no files will be changed"
+        )
+
+
     log(
         f"Source: {COMPLETE}"
     )
+
 
     log(
         f"Output: {ONGOING}"
     )
 
 
-    # Создаём output-каталог при необходимости.
+    # ========================================================
+    # DRY-RUN
+    # ========================================================
+    #
+    # Выполняем ровно один scan и завершаемся.
+    #
+    # Каталог ONGOING специально не создаём.
+    # ========================================================
+
+    if args.dry_run:
+
+        scan(
+            dry_run=True
+        )
+
+        return
+
+
+    # ========================================================
+    # OUTPUT DIRECTORY
+    # ========================================================
+
     ONGOING.mkdir(
         parents=True,
         exist_ok=True,
@@ -1722,33 +2439,33 @@ def main() -> None:
 
 
     # ========================================================
-    # БЕСКОНЕЧНЫЙ ЦИКЛ
+    # DAEMON LOOP
     # ========================================================
     #
-    # systemd следит за процессом.
+    # Ссылка на lock_handle остаётся живой всё время,
+    # пока работает main().
     #
-    # Если процесс неожиданно завершится,
-    # systemd перезапустит его.
+    # Это гарантирует, что flock не будет освобождён
+    # преждевременно из-за уничтожения объекта.
     # ========================================================
+
+    _ = lock_handle
+
 
     while True:
 
         try:
 
-            # Один проход поиска и обработки.
             scan()
 
 
         except Exception as exc:
 
-            # Ошибка самого сканирования не должна
-            # полностью остановить worker.
             log(
                 f"Scan error: {exc}"
             )
 
 
-        # Ждём до следующего сканирования.
         time.sleep(
             SCAN_INTERVAL
         )
