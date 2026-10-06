@@ -672,25 +672,6 @@ def similarity_score(
     if not video_series or not candidate_series:
         return -1000
 
-    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
-    #
-    # Раньше здесь разрешалось:
-    #
-    #   video_series in candidate_series
-    #
-    # или:
-    #
-    #   candidate_series in video_series
-    #
-    # Это позволяло подключить track от:
-    #
-    #   Anime A Something Else
-    #
-    # к:
-    #
-    #   Anime A
-    #
-    # Теперь требуется строгое совпадение.
     if video_series != candidate_series:
         return -1000
 
@@ -817,8 +798,6 @@ def external_search_directories(
     try:
         for child in video.parent.iterdir():
 
-            # Симлинки не используются
-            # как каталоги внешних дорожек.
             if child.is_symlink():
                 continue
 
@@ -892,14 +871,6 @@ def find_external_tracks(
 
         for candidate in entries:
 
-            # =================================================
-            # SYMLINK PROTECTION
-            # =================================================
-            #
-            # Даже если symlink указывает на допустимый
-            # extension, он не должен использоваться
-            # как внешний input.
-            #
             if candidate.is_symlink():
                 continue
 
@@ -928,10 +899,6 @@ def find_external_tracks(
             if candidate == video:
                 continue
 
-            # =================================================
-            # ЯЗЫК
-            # =================================================
-
             language = candidate_language(
                 candidate
             )
@@ -939,22 +906,14 @@ def find_external_tracks(
             if language not in LANGUAGE_PRIORITY:
                 continue
 
-            # =================================================
-            # MATCHING
-            # =================================================
-
             score = similarity_score(
                 video,
                 candidate,
             )
 
-            # Консервативный порог.
             if score < 80:
                 continue
 
-            # Специальный каталог даёт небольшой бонус.
-            #
-            # Он НЕ заменяет matching по series/episode.
             if (
                 candidate.parent
                 != video.parent
@@ -969,8 +928,6 @@ def find_external_tracks(
                 )
             )
 
-    # Сначала score.
-    # При одинаковом score — RU -> JP -> EN.
     candidates.sort(
         key=lambda item: (
             -item[0],
@@ -1310,14 +1267,10 @@ def build_ffmpeg_command(
 
     command = [
         "ffmpeg",
-
         "-hide_banner",
-
         "-loglevel",
         "warning",
-
         "-y",
-
         "-i",
         str(source),
     ]
@@ -1365,8 +1318,6 @@ def build_ffmpeg_command(
     # EXTERNAL AUDIO
     # --------------------------------------------------------
 
-    # Внешний audio input идёт после source,
-    # поэтому его индекс всегда 1.
     if external_audio:
         command += [
             "-map",
@@ -1402,12 +1353,6 @@ def build_ffmpeg_command(
     # ========================================================
     # VIDEO SCALE
     # ========================================================
-    #
-    # input <= 720p -> исходная высота
-    # input > 720p  -> высота 720
-    #
-    # -2 автоматически рассчитывает чётную ширину.
-    # ========================================================
 
     command += [
         "-vf",
@@ -1442,16 +1387,6 @@ def build_ffmpeg_command(
     # ========================================================
     # DEFAULT AUDIO
     # ========================================================
-    #
-    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
-    #
-    # ffmpeg может сохранить disposition, полученный
-    # из исходных streams.
-    #
-    # Поэтому сначала сбрасываем default у ВСЕХ
-    # output audio streams, затем ставим default
-    # только первой дорожке.
-    # ========================================================
 
     audio_count = (
         len(audio_tracks)
@@ -1472,12 +1407,6 @@ def build_ffmpeg_command(
 
     # ========================================================
     # DEFAULT SUBTITLE
-    # ========================================================
-    #
-    # Аналогично audio:
-    #
-    #   сначала очищаем все dispositions;
-    #   затем первая subtitle = default.
     # ========================================================
 
     subtitle_count = (
@@ -1517,6 +1446,14 @@ def remove_file_safely(
 
     Ошибка удаления не приводит к исключению
     из основного workflow.
+
+    ВАЖНО:
+
+        Эта функция используется только для
+        временных или повреждённых output-файлов.
+
+        Исходный source-файл через неё никогда
+        автоматически не удаляется.
     """
 
     try:
@@ -1546,19 +1483,19 @@ def process_video(
     В обычном режиме:
 
         1. определяет output;
-        2. проверяет стабильность;
-        3. один раз вызывает ffprobe;
-        4. определяет internal tracks;
-        5. определяет external tracks;
-        6. создаёт .processing;
-        7. запускает ffmpeg;
-        8. проверяет .processing;
-        9. делает atomic rename;
-        10. проверяет final output;
-        11. повторно проверяет source;
-        12. удаляет source.
+        2. проверяет существующий output;
+        3. проверяет стабильность;
+        4. один раз вызывает ffprobe;
+        5. определяет internal tracks;
+        6. определяет external tracks;
+        7. создаёт .processing;
+        8. запускает ffmpeg;
+        9. проверяет .processing;
+        10. делает atomic rename;
+        11. проверяет final output.
 
-    При любой ошибке source остаётся.
+    Исходный source-файл никогда автоматически
+    не удаляется.
     """
 
     # ========================================================
@@ -1569,14 +1506,33 @@ def process_video(
         video
     )
 
-    # Если валидный output уже существует,
-    # повторно обрабатывать source не нужно.
+    # Если output уже существует, сначала проверяем его.
+    #
+    # Валидный output означает, что source уже обработан.
+    #
+    # Если output повреждён или неполный, удаляем только
+    # этот output и разрешаем повторную конвертацию source.
     if output.exists():
+
+        if validate_output(
+            output
+        ):
+            log(
+                f"Output already exists and is valid, "
+                f"skipping: {output}"
+            )
+            return
+
         log(
-            f"Output already exists, "
-            f"skipping: {output}"
+            f"Existing output is invalid, "
+            f"removing: {output}"
         )
-        return
+
+        if not remove_file_safely(
+            output,
+            "invalid existing output",
+        ):
+            return
 
     # ========================================================
     # STABILITY
@@ -1602,16 +1558,6 @@ def process_video(
         )
 
     except ProbeError as exc:
-        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
-        #
-        # Ошибка ffprobe НЕ означает:
-        #
-        #     audio_tracks = []
-        #
-        # и НЕ должна приводить к поиску external
-        # tracks или запуску ffmpeg.
-        #
-        # Source остаётся нетронутым.
         log(
             f"Cannot inspect source, "
             f"skipping: {video}: {exc}"
@@ -1620,13 +1566,6 @@ def process_video(
 
     # ========================================================
     # EXTERNAL TRACKS
-    # ========================================================
-    #
-    # Ищем external tracks всегда.
-    #
-    # Но ниже они будут использованы только если
-    # действительно имеют более высокий языковой приоритет,
-    # чем уже найденная внутренняя дорожка.
     # ========================================================
 
     external_audio = select_external_track(
@@ -1643,22 +1582,6 @@ def process_video(
 
     # ========================================================
     # AUDIO PRIORITY
-    # ========================================================
-    #
-    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
-    #
-    # Раньше external audio вообще не искался,
-    # если существовала любая internal audio.
-    #
-    # Теперь:
-    #
-    #   internal EN + external RU -> external RU
-    #   internal JP + external RU -> external RU
-    #   internal RU + external EN -> internal RU
-    #
-    # Используется приоритет:
-    #
-    #   RU -> JP -> EN
     # ========================================================
 
     if (
@@ -1680,18 +1603,10 @@ def process_video(
             LANGUAGE_PRIORITY[external_language]
             >= internal_priority
         ):
-            # Internal track имеет такой же
-            # или более высокий приоритет.
             external_audio = None
-
-    # Если internal audio отсутствует,
-    # external_audio остаётся выбранным.
 
     # ========================================================
     # SUBTITLE PRIORITY
-    # ========================================================
-    #
-    # Аналогичная логика для субтитров.
     # ========================================================
 
     if (
@@ -1769,21 +1684,6 @@ def process_video(
 
     # ========================================================
     # FFMPEG COMMAND
-    # ========================================================
-    #
-    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
-    #
-    # build_ffmpeg_command() больше не вызывает ffprobe.
-    #
-    # Поэтому в рамках одного source:
-    #
-    #     ffprobe -> один раз
-    #     ffmpeg  -> один раз
-    #
-    # вместо:
-    #
-    #     ffprobe -> find_internal_tracks()
-    #     ffprobe -> build_ffmpeg_command()
     # ========================================================
 
     command = build_ffmpeg_command(
@@ -1888,19 +1788,14 @@ def process_video(
         )
 
         # ====================================================
-        # ПОВТОРНАЯ ПРОВЕРКА FINAL OUTPUT
+        # ПРОВЕРКА FINAL OUTPUT
         # ====================================================
-        #
-        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
         #
         # Если final output оказался повреждённым,
         # его обязательно удаляем.
         #
-        # Иначе следующая итерация увидит:
-        #
-        #     output.exists() == True
-        #
-        # и навсегда пропустит source.
+        # Source при этом НЕ удаляется.
+        # Следующий scan сможет повторить конвертацию.
         # ========================================================
 
         if not validate_output(
@@ -1911,54 +1806,40 @@ def process_video(
                 f"{output}"
             )
 
-            # Нельзя оставлять повреждённый
-            # final output.
             remove_file_safely(
                 output,
                 "invalid final output",
             )
 
-            # Source НЕ удаляется.
-            # Следующий scan сможет повторить
-            # конвертацию.
             return
 
         # ====================================================
-        # ПОВТОРНАЯ ПРОВЕРКА SOURCE
+        # ЗАВЕРШЕНИЕ
         # ====================================================
         #
-        # Между первым is_stable() и завершением ffmpeg
-        # source мог измениться.
+        # Source намеренно НЕ удаляется.
         #
-        # Перед удалением source убеждаемся, что он
-        # всё ещё стабилен.
+        # При следующем scan output будет проверен.
+        #
+        # Если output валиден:
+        #
+        #     source -> SKIP
+        #
+        # Если output повреждён:
+        #
+        #     output -> DELETE
+        #     source -> RECONVERT
+        #
+        # Удаление source выполняется пользователем
+        # вручную.
         # ========================================================
-
-        if not is_stable(
-            video
-        ):
-            log(
-                "Source changed or is no longer "
-                "stable after conversion; "
-                f"keeping source: {video}"
-            )
-
-            # Output уже валиден и остаётся.
-            # Source остаётся для безопасности.
-            return
-
-        # ====================================================
-        # УДАЛЕНИЕ SOURCE
-        # ====================================================
-
-        video.unlink()
 
         log(
             f"Completed: {output}"
         )
 
         log(
-            f"Source deleted: {video}"
+            f"Source retained: {video}"
         )
 
     except Exception as exc:
@@ -2006,12 +1887,7 @@ def scan(
         # ====================================================
         # SYMLINK PROTECTION
         # ====================================================
-        #
-        # Path.is_file() следует за symlink.
-        #
-        # Поэтому проверка is_symlink() должна идти
-        # ДО is_file().
-        #
+
         if path.is_symlink():
             continue
 
