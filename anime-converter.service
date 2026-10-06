@@ -1,0 +1,16 @@
+[Unit]
+Description=Anime Converter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chaser
+Group=chaser
+ExecStart=/usr/bin/python3 /usr/local/bin/anime-converter.py
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
